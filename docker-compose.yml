@@ -1,0 +1,218 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database - Primary data store
+  postgres:
+    image: postgres:15-alpine
+    container_name: stock-prediction-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-stock_prediction}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_dev_password}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - stock-network
+    restart: unless-stopped
+
+  # Redis - Caching and message broker
+  redis:
+    image: redis:7-alpine
+    container_name: stock-prediction-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_dev_password}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - stock-network
+    restart: unless-stopped
+
+  # MLflow - ML experiment tracking and model registry
+  mlflow:
+    image: python:3.10-slim
+    container_name: stock-prediction-mlflow
+    working_dir: /app
+    command: >
+      bash -c "pip install mlflow[psycopg2] -q &&
+               mlflow server
+               --backend-store-uri postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres_dev_password}@postgres:5432/${POSTGRES_DB:-stock_prediction}_mlflow
+               --default-artifact-root /mlflow-artifacts
+               --host 0.0.0.0
+               --port 5000"
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_artifacts:/mlflow-artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - stock-network
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_dev_password}
+
+  # Postgres for Airflow metadata
+  postgres-airflow:
+    image: postgres:15-alpine
+    container_name: stock-prediction-postgres-airflow
+    environment:
+      POSTGRES_DB: ${AIRFLOW_DB:-airflow}
+      POSTGRES_USER: ${AIRFLOW_DB_USER:-airflow}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow_dev_password}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_airflow_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER:-airflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - stock-network
+    restart: unless-stopped
+
+  # Airflow - Workflow orchestration (development environment)
+  airflow:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.airflow
+    container_name: stock-prediction-airflow
+    environment:
+      AIRFLOW_HOME: /airflow
+      AIRFLOW__CORE__DAGS_FOLDER: /airflow/dags
+      AIRFLOW__CORE__PLUGINS_FOLDER: /airflow/plugins
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+      AIRFLOW__CORE__UNIT_TEST_MODE: 'True'
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:-airflow_dev_password}@postgres-airflow:5432/${AIRFLOW_DB:-airflow}
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'True'
+      AIRFLOW__SCHEDULER__CATCHUP_BY_DEFAULT: 'False'
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./airflow/dags:/airflow/dags
+      - ./airflow/logs:/airflow/logs
+      - ./airflow/plugins:/airflow/plugins
+      - ./production:/airflow/production
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+    networks:
+      - stock-network
+    restart: unless-stopped
+
+  # Prometheus - Metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: stock-prediction-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - stock-network
+    restart: unless-stopped
+
+  # Grafana - Metrics visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: stock-prediction-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: 'grafana-piechart-panel'
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    networks:
+      - stock-network
+    restart: unless-stopped
+
+  # Adminer - Database management UI
+  adminer:
+    image: adminer:latest
+    container_name: stock-prediction-adminer
+    ports:
+      - "8081:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    depends_on:
+      - postgres
+    networks:
+      - stock-network
+    restart: unless-stopped
+
+  # Development environment (optional)
+  dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    container_name: stock-prediction-dev
+    working_dir: /workspace
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+    volumes:
+      - .:/workspace
+      - /workspace/.venv  # Preserve venv
+    environment:
+      PYTHONUNBUFFERED: 1
+      PYTHONPATH: /workspace
+      POSTGRES_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres_dev_password}@postgres:5432/${POSTGRES_DB:-stock_prediction}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_dev_password}@redis:6379
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    networks:
+      - stock-network
+    restart: unless-stopped
+
+networks:
+  stock-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  postgres_airflow_data:
+    driver: local
+  redis_data:
+    driver: local
+  mlflow_artifacts:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local

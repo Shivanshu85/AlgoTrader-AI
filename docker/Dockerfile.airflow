@@ -1,0 +1,48 @@
+# Airflow Image - Orchestration environment
+FROM apache/airflow:2.7.0-python3.10
+
+# Switch to root to install additional packages
+USER root
+
+# Install additional system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Switch back to airflow user
+USER airflow
+
+# Set working directory
+WORKDIR /airflow
+
+# Copy project files
+COPY pyproject.toml pyproject.toml
+COPY README.md README.md
+COPY production/ production/
+COPY airflow/ airflow/
+COPY scripts/ scripts/
+
+# Install project dependencies and airflow providers
+RUN pip install --no-cache-dir --user \
+    -e . \
+    apache-airflow-providers-postgres \
+    apache-airflow-providers-redis \
+    apache-airflow-tutorial
+
+# Expose port
+EXPOSE 8080
+
+# Default environment
+ENV AIRFLOW_HOME=/airflow
+ENV AIRFLOW__CORE__DAGS_FOLDER=/airflow/dags
+ENV AIRFLOW__CORE__LOAD_EXAMPLES=False
+ENV AIRFLOW__CORE__UNIT_TEST_MODE=True
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Default command
+CMD ["bash", "-c", "airflow db upgrade && airflow webserver"]
